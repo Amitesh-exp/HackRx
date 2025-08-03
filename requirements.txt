@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+langchain
+langchain-google-genai
+langchain-community
+chromadb
+pypdf
+nltk
