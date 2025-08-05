@@ -172,6 +172,7 @@
 
 
 import os
+os.environ["UVLOOP_NO"] = "1"
 import requests
 import uuid
 import tempfile
