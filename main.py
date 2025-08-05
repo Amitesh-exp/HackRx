@@ -172,7 +172,6 @@
 
 
 import os
-os.environ["UVLOOP_NO"] = "1"
 import requests
 import uuid
 import tempfile
@@ -195,30 +194,44 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 
+# --- Scikit-learn Imports for TF-IDF ---
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from ragas import evaluate
-from ragas.metrics import faithfulness, answer_relevancy, context_recall, context_precision
-from datasets import Dataset
-
+# --- Load environment variables ---
 load_dotenv()
 
+# We will now rely on the library to automatically find the key from the .env file
 if not os.getenv("GOOGLE_API_KEY"):
-    raise ValueError("GOOGLE_API_KEY not found in environment variables.")
+    raise ValueError("GOOGLE_API_KEY not found in environment variables. Please set it in your .env file.")
+
+# Fetch the authentication token from environment variables for better security
 EXPECTED_TOKEN = os.getenv("EXPECTED_TOKEN")
 if not EXPECTED_TOKEN:
-    raise ValueError("EXPECTED_TOKEN not found in environment variables.")
+    raise ValueError("EXPECTED_TOKEN not found in environment variables. Please set it in your .env file.")
 
-app = FastAPI(title="Retrieval System API", description="Hybrid RAG API")
+# --- FastAPI App and Router Setup ---
+app = FastAPI(
+    title="Retrieval System API",
+    description="API to answer questions about a document using a Hybrid RAG pipeline."
+)
+
+# Create a router with the /api/v1 prefix
 router = APIRouter(prefix="/api/v1")
 
+# --- Authentication ---
 security = HTTPBearer()
+
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     if not credentials or credentials.scheme != "Bearer" or credentials.credentials != EXPECTED_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid or missing token")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return credentials
 
+# --- Pydantic Models ---
 class QueryRequest(BaseModel):
     documents: HttpUrl
     questions: List[str]
@@ -226,17 +239,22 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answers: List[str]
 
-class EvaluationRequest(BaseModel):
-    documents: HttpUrl
-    questions: List[str]
-    ground_truths: List[str]
-
+# --- LLM and Embedding Setup ---
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.0, max_output_tokens=1024)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
+# --- Final, Intelligent RAG Prompt ---
 RAG_PROMPT_TEMPLATE = """
 You are an expert insurance policy analyst. Your task is to provide a precise and definitive answer to the user's QUESTION based *only* on the provided CONTEXT.
-... [unchanged prompt for brevity] ...
+
+Your reasoning process must follow these rules:
+1.  **Identify the Question's Core Intent:** First, understand the specific type of information the user wants. For questions about time periods, differentiate carefully. For example, "waiting period for any illness" is different from "waiting period for pre-existing diseases".
+2.  **Scan for Specifics:** Search the CONTEXT for concrete details that match the exact intent. Prioritize explicit numbers (like '30 days' or '180 days') and clear 'Exclusion' clauses over general definitions.
+3.  **Handle Ambiguity with Precision:** If the CONTEXT contains multiple, seemingly relevant time periods, you must choose the one that most accurately corresponds to the user's specific question. For "waiting period for any illness," find the 'initial waiting period' clause. For "grace period," find the clause about premium payment after the due date.
+4.  **Synthesize a Definitive Answer:** Based on the single best piece of information you've identified, construct a clear, detailed, and unambiguous final answer of about 30-50 words.
+5.  **Default to No Coverage:** If the question asks about coverage for a specific item (like "dental") and you cannot find a clause that explicitly states it is covered, you must conclude that it is not covered.
+6.  **Speak Directly:** Formulate your answer as a direct statement. Do not use phrases like "The provided text states," "According to the document," or "Based on the context."
+
 CONTEXT:
 {context}
 
@@ -248,71 +266,69 @@ Final Answer:
 rag_prompt = PromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
 rag_chain = rag_prompt | llm | StrOutputParser()
 
+# --- TF-IDF Helper Function ---
 def process_text_for_tfidf(text: str) -> str:
-    return re.sub(r'[^\w\s]', '', text.lower())
+    processed_text = text.lower()
+    return re.sub(r'[^\w\s]', '', processed_text)
 
-SYNONYM_MAP = {
-    "restore benefit": ["restoration of sum insured", "automatic reinstatement", "reinstatement benefit", "sum insured restoration", "recovery benefit", "recovery"],
-    "dental treatment": ["oral care", "tooth extraction", "dental procedure"],
-    "pre-existing diseases": ["ped", "chronic conditions", "existing health issues"],
-}
-
-def expand_query_with_synonyms(query: str) -> str:
-    for key, synonyms in SYNONYM_MAP.items():
-        if key in query.lower():
-            query += " " + " ".join(synonyms)
-    return query
-
-def regex_snippet_search(query: str, chunks: List[Document], keywords: List[str]) -> List[Document]:
-    results = []
-    for chunk in chunks:
-        text = chunk.page_content.lower()
-        if any(re.search(rf"\\b{kw.lower()}\\b", text) for kw in keywords):
-            results.append(chunk)
-    return results
-
+# --- Retrieval Setup ---
 def setup_retrieval_components(pdf_path: str):
+    """
+    Loads, splits, and indexes a document for both semantic and keyword search.
+    """
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
     full_text = " ".join(doc.page_content for doc in documents)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=300)
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=200)
     chunks = splitter.create_documents([full_text])
 
+    # 1. Setup Chroma for semantic search
     vector_store = Chroma.from_documents(documents=chunks, embedding=embeddings)
     retriever_sim = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 12})
     retriever_mmr = vector_store.as_retriever(search_type="mmr", search_kwargs={"k": 12})
 
+    # 2. Setup TF-IDF for keyword search
     processed_chunks = [process_text_for_tfidf(chunk.page_content) for chunk in chunks]
-    vectorizer = TfidfVectorizer(stop_words='english', ngram_range=(1, 2))
+    vectorizer = TfidfVectorizer(stop_words='english', ngram_range=(1,2))
     tfidf_matrix = vectorizer.fit_transform(processed_chunks)
 
     return retriever_sim, retriever_mmr, vectorizer, tfidf_matrix, chunks
 
 def perform_hybrid_retrieval(question: str, retriever_sim, retriever_mmr, vectorizer, tfidf_matrix, chunks):
+    """
+    Performs retrieval using all three methods and combines the results.
+    """
+    # 1. Semantic search
     docs_sim = retriever_sim.invoke(question)
     docs_mmr = retriever_mmr.invoke(question)
 
-    expanded_query = expand_query_with_synonyms(question)
-    processed_query = process_text_for_tfidf(expanded_query)
+    # 2. TF-IDF keyword search
+    processed_query = process_text_for_tfidf(question)
     query_embedding = vectorizer.transform([processed_query])
     similarities = cosine_similarity(tfidf_matrix, query_embedding)
     ranked_indices = np.argsort(similarities[:, 0])[::-1]
     docs_tfidf = [chunks[i] for i in ranked_indices[:5]]
 
-    regex_keywords = SYNONYM_MAP.get(question.lower(), []) + [question]
-    docs_regex = regex_snippet_search(question, chunks, regex_keywords)
+    print(f"\n[QUESTION]: {question}")
+    print(f"SIMILARITY DOCS: {len(docs_sim)}")
+    print(f"MMR DOCS: {len(docs_mmr)}")
+    print(f"TF-IDF DOCS: {len(docs_tfidf)}")
 
-    all_docs = docs_sim + docs_mmr + docs_tfidf + docs_regex
+    # 3. Combine and deduplicate results
+    all_docs = docs_sim + docs_mmr + docs_tfidf
     unique_docs = list({doc.page_content: doc for doc in all_docs}.values())
 
     return unique_docs
 
+# --- Main RAG Endpoint ---
 @router.post("/hackrx/run", response_model=QueryResponse, dependencies=[Depends(verify_token)])
 async def process_document_and_answer_questions(payload: QueryRequest = Body(...)):
     temp_pdf_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pdf")
     try:
         response = requests.get(str(payload.documents))
         response.raise_for_status()
+
         with open(temp_pdf_path, 'wb') as f:
             f.write(response.content)
 
@@ -320,12 +336,20 @@ async def process_document_and_answer_questions(payload: QueryRequest = Body(...
         answers = []
 
         for question in payload.questions:
+            # 1. Retrieve a wide net of documents using hybrid search
             retrieved_docs = perform_hybrid_retrieval(question, retriever_sim, retriever_mmr, vectorizer, tfidf_matrix, chunks)
-            context = "\n\n".join([doc.page_content for doc in retrieved_docs])
-            final_answer = rag_chain.invoke({"context": context, "question": question})
+            retrieved_context = "\n\n".join([doc.page_content for doc in retrieved_docs])
+
+            # 2. Generate the final answer using the single, intelligent prompt
+            final_answer = rag_chain.invoke({
+                "context": retrieved_context,
+                "question": question
+            })
+
             answers.append(final_answer)
 
         return QueryResponse(answers=answers)
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -334,43 +358,10 @@ async def process_document_and_answer_questions(payload: QueryRequest = Body(...
         if os.path.exists(temp_pdf_path):
             os.remove(temp_pdf_path)
 
-@router.post("/evaluate", dependencies=[Depends(verify_token)])
-async def evaluate_rag_pipeline(payload: EvaluationRequest = Body(...)):
-    if len(payload.questions) != len(payload.ground_truths):
-        raise HTTPException(status_code=400, detail="Mismatched questions and ground truths")
-
-    temp_pdf_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pdf")
-    try:
-        response = requests.get(str(payload.documents))
-        response.raise_for_status()
-        with open(temp_pdf_path, 'wb') as f:
-            f.write(response.content)
-
-        retriever_sim, retriever_mmr, vectorizer, tfidf_matrix, chunks = setup_retrieval_components(temp_pdf_path)
-        eval_data = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
-
-        for i, question in enumerate(payload.questions):
-            docs = perform_hybrid_retrieval(question, retriever_sim, retriever_mmr, vectorizer, tfidf_matrix, chunks)
-            context = "\n\n".join([doc.page_content for doc in docs])
-            answer = rag_chain.invoke({"context": context, "question": question})
-            eval_data["question"].append(question)
-            eval_data["answer"].append(answer)
-            eval_data["contexts"].append([doc.page_content for doc in docs])
-            eval_data["ground_truth"].append(payload.ground_truths[i])
-
-        dataset = Dataset.from_dict(eval_data)
-        result = evaluate(dataset=dataset, metrics=[faithfulness, answer_relevancy, context_recall, context_precision])
-        return result
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Evaluation error: {e}")
-    finally:
-        if os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
-
+# --- Health Check ---
 @router.get("/", tags=["Health Check"])
 def read_root():
     return {"status": "ok", "message": "Welcome to the Retrieval System API v1!"}
 
+# Include the router in the main FastAPI app
 app.include_router(router)
