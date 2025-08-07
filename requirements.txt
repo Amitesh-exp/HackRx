@@ -7,8 +7,5 @@ langchain-google-genai
 langchain-community
 chromadb
 pypdf
-nltk
-ragas
-datasets
 scikit-learn
 numpy
